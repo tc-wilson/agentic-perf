@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.handoff import check_handoff
+from orchestrator.main import HANDOFF_RETRY_STATUS, _is_valid_rewind
 
 
 class TestResourceToProvisioning:
@@ -452,3 +455,73 @@ class TestHostIdentityEnforcement:
         }
         ok, reason = check_handoff("awaiting_provision", ticket)
         assert ok, reason
+
+
+class TestRewindValidation:
+    """Every HANDOFF_RETRY_STATUS mapping must be a valid transition."""
+
+    def test_all_rewind_targets_are_valid_transitions(self):
+        for from_status, to_status in HANDOFF_RETRY_STATUS.items():
+            assert _is_valid_rewind(from_status, to_status), (
+                f"Invalid rewind: {from_status} -> {to_status}"
+            )
+
+    def test_evaluating_convergence_not_in_retry_map(self):
+        assert "evaluating_convergence" not in HANDOFF_RETRY_STATUS
+
+    def test_invalid_rewind_rejected(self):
+        assert not _is_valid_rewind("evaluating_convergence", "executing_benchmark")
+
+    def test_valid_rewind_accepted(self):
+        assert _is_valid_rewind("executing_benchmark", "awaiting_provision")
+
+    def test_unknown_status_rejected(self):
+        assert not _is_valid_rewind("nonexistent", "awaiting_hardware")
+
+
+class TestBlockHandoffFailed:
+    """_block_handoff_failed writes guidance_summary and transitions."""
+
+    @pytest.mark.asyncio
+    async def test_evaluating_convergence_skips_rewind(self):
+        from unittest.mock import AsyncMock, patch
+
+        from orchestrator.main import _block_handoff_failed
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.patch = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "orchestrator.main.AuditedAsyncHTTPClient",
+            return_value=mock_client,
+        ):
+            await _block_handoff_failed(
+                "http://fake:8090",
+                "PERF-TEST",
+                "no run_id and benchmark_status=None",
+                "evaluating_convergence",
+            )
+
+        calls = [
+            (c.args[0] if c.args else c.kwargs.get("url", ""))
+            for c in mock_client.post.call_args_list
+        ]
+        rewind_calls = [c for c in calls if "transition" in c]
+        assert len(rewind_calls) == 1, (
+            "Only the guidance transition should happen, no rewind"
+        )
+
+        patch_call = mock_client.patch.call_args
+        body = patch_call.kwargs.get(
+            "json", patch_call.args[1] if len(patch_call.args) > 1 else {}
+        )
+        gs = body["fields"]["guidance_summary"]
+        assert gs["reason"] == "handoff_blocked"
+        assert "no run_id" in gs["details"]
+        assert gs["status_when_blocked"] == "evaluating_convergence"

@@ -1288,8 +1288,19 @@ HANDOFF_RETRY_STATUS = {
     "awaiting_provision": "awaiting_hardware",
     "executing_benchmark": "awaiting_provision",
     "awaiting_review": "executing_benchmark",
-    "evaluating_convergence": "executing_benchmark",
 }
+
+
+def _is_valid_rewind(from_status: str, to_status: str) -> bool:
+    """Check whether a rewind transition is valid per the state machine."""
+    from state_store.models import VALID_TRANSITIONS, TicketStatus
+
+    try:
+        from_ts = TicketStatus(from_status)
+        to_ts = TicketStatus(to_status)
+    except ValueError:
+        return False
+    return to_ts in VALID_TRANSITIONS.get(from_ts, [])
 
 
 async def _block_handoff_failed(
@@ -1298,20 +1309,60 @@ async def _block_handoff_failed(
     reason: str,
     current_status: str = "",
     event_bus: EventBus | None = None,
-) -> None:
+) -> bool:
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
     async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
         if retry_status:
-            rewind_comment = (
-                f"Rewinding to {retry_status} so the agent"
-                f" can retry after user guidance"
+            if _is_valid_rewind(current_status, retry_status):
+                rewind_comment = (
+                    f"Rewinding to {retry_status} so the agent"
+                    f" can retry after user guidance"
+                )
+                r = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": retry_status,
+                        "comment": rewind_comment,
+                    },
+                )
+                if r.status_code >= 400:
+                    logger.warning(
+                        "Rewind %s -> %s failed (%s) for %s",
+                        current_status,
+                        retry_status,
+                        r.status_code,
+                        ticket_id,
+                    )
+            else:
+                logger.warning(
+                    "Skipping invalid rewind %s -> %s for %s",
+                    current_status,
+                    retry_status,
+                    ticket_id,
+                )
+
+        summary = {
+            "reason": "handoff_blocked",
+            "details": reason,
+            "status_when_blocked": current_status,
+            "suggested_actions": [
+                "Review the handoff failure reason above",
+                "Resolve the missing precondition and retry",
+            ],
+        }
+        r = await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"guidance_summary": summary}},
+        )
+        if r.status_code >= 400:
+            logger.warning(
+                "Failed to write guidance_summary for %s: %s",
+                ticket_id,
+                r.status_code,
             )
-            await client.post(
-                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-                json={"status": retry_status, "comment": rewind_comment},
-            )
-        await client.post(
+
+        r = await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
                 "author": "orchestrator",
@@ -1323,14 +1374,28 @@ async def _block_handoff_failed(
                 ),
             },
         )
-        block_comment = f"Handoff validation failed: {reason}"
-        await client.post(
+        if r.status_code >= 400:
+            logger.warning(
+                "Failed to post handoff comment for %s: %s",
+                ticket_id,
+                r.status_code,
+            )
+
+        r = await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/transition",
             json={
                 "status": "awaiting_customer_guidance",
-                "comment": block_comment,
+                "comment": f"Handoff validation failed: {reason}",
             },
         )
+        if r.status_code >= 400:
+            logger.error(
+                "Failed to transition %s to guidance: %s",
+                ticket_id,
+                r.status_code,
+            )
+            return False
+    return True
 
 
 async def _process_stop_requests(
@@ -1984,14 +2049,15 @@ async def _poll_loop_after_lease(
                             logger.warning(
                                 f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                            dispatcher.mark_handoff_blocked(tid, status)
-                            await _block_handoff_failed(
+                            blocked_ok = await _block_handoff_failed(
                                 config.state_store_url,
                                 tid,
                                 reason,
                                 status,
                                 event_bus=dispatcher.events,
                             )
+                            if blocked_ok:
+                                dispatcher.mark_handoff_blocked(tid, status)
                         continue
 
                     # Per-user/group quota check (multi-user only).
