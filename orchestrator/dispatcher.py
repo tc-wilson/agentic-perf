@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -106,6 +107,9 @@ class Dispatcher:
         self._renewal_tasks: dict[str, asyncio.Task] = {}
         self._claim_ids: dict[str, str] = {}
         self._handoff_blocked: set[tuple[str, str]] = set()
+        self._handoff_retry_counts: dict[tuple[str, str], int] = {}
+        self._dispatch_failure_counts: dict[tuple[str, str], int] = {}
+        self._dispatch_cooldowns: dict[tuple[str, str], float] = {}
         self._quota_blocked: set[str] = set()
         self._quota_warned: set[str] = set()
         self._introspection_tasks: dict[str, asyncio.Task] = {}
@@ -375,6 +379,79 @@ class Dispatcher:
             for ticket_id, status in self._handoff_blocked
             if ticket_statuses.get(ticket_id) == status
         }
+        # Prune stale retry/failure counts for tickets that changed status.
+        self._handoff_retry_counts = {
+            k: v
+            for k, v in self._handoff_retry_counts.items()
+            if ticket_statuses.get(k[0]) == k[1]
+        }
+        self._dispatch_failure_counts = {
+            k: v
+            for k, v in self._dispatch_failure_counts.items()
+            if ticket_statuses.get(k[0]) == k[1]
+        }
+        self._dispatch_cooldowns = {
+            k: v
+            for k, v in self._dispatch_cooldowns.items()
+            if ticket_statuses.get(k[0]) == k[1]
+        }
+
+    # -- Handoff retry tracking (bounded recovery) --
+
+    MAX_HANDOFF_RETRIES = 5
+
+    def record_handoff_retry(self, ticket_id: str, status: str) -> int:
+        """Increment and return the handoff retry count for (ticket, status)."""
+        key = (ticket_id, status)
+        count = self._handoff_retry_counts.get(key, 0) + 1
+        self._handoff_retry_counts[key] = count
+        return count
+
+    def handoff_retries_exhausted(self, ticket_id: str, status: str) -> bool:
+        key = (ticket_id, status)
+        return self._handoff_retry_counts.get(key, 0) >= self.MAX_HANDOFF_RETRIES
+
+    def clear_handoff_retries(self, ticket_id: str) -> None:
+        self._handoff_retry_counts = {
+            k: v for k, v in self._handoff_retry_counts.items() if k[0] != ticket_id
+        }
+
+    # -- Dispatch failure tracking (crash-loop prevention) --
+
+    MAX_DISPATCH_FAILURES = 5
+    DISPATCH_BACKOFF_BASE = 5.0
+    DISPATCH_BACKOFF_CAP = 300.0
+
+    def record_dispatch_failure(self, ticket_id: str, status: str) -> int:
+        """Increment failure count and set a cooldown before next dispatch."""
+        key = (ticket_id, status)
+        count = self._dispatch_failure_counts.get(key, 0) + 1
+        self._dispatch_failure_counts[key] = count
+        delay = min(
+            self.DISPATCH_BACKOFF_BASE * (2 ** (count - 1)),
+            self.DISPATCH_BACKOFF_CAP,
+        )
+        self._dispatch_cooldowns[key] = time.monotonic() + delay
+        return count
+
+    def is_dispatch_cooling_down(self, ticket_id: str, status: str) -> bool:
+        key = (ticket_id, status)
+        deadline = self._dispatch_cooldowns.get(key)
+        if deadline is None:
+            return False
+        return time.monotonic() < deadline
+
+    def dispatch_failures_exhausted(self, ticket_id: str, status: str) -> bool:
+        key = (ticket_id, status)
+        return self._dispatch_failure_counts.get(key, 0) >= self.MAX_DISPATCH_FAILURES
+
+    def clear_dispatch_failures(self, ticket_id: str) -> None:
+        self._dispatch_failure_counts = {
+            k: v for k, v in self._dispatch_failure_counts.items() if k[0] != ticket_id
+        }
+        self._dispatch_cooldowns = {
+            k: v for k, v in self._dispatch_cooldowns.items() if k[0] != ticket_id
+        }
 
     def is_quota_blocked(self, ticket_id: str) -> bool:
         return ticket_id in self._quota_blocked
@@ -441,6 +518,7 @@ class Dispatcher:
         await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
         self.clear_handoff_blocked(ticket_id)
+        self.clear_handoff_retries(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
         self.clear_quota_blocked(ticket_id)

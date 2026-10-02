@@ -722,6 +722,39 @@ async def _advance_plan(
             ):
                 next_status = "preparing_platform"
             if next_status:
+                # Block advance to benchmark when provisioning
+                # did not complete.  Scoped to benchmark so that
+                # non-benchmark successors (review, teardown,
+                # another provision step) are not blocked.
+                if (
+                    step.get("agent_type") == "provision"
+                    and next_step.get("agent_type") == "benchmark"
+                    and cf.get("provisioning_complete") is not True
+                ):
+                    logger.warning(
+                        "[advance-plan] %s: provisioning agent succeeded "
+                        "but provisioning_complete is not True — blocking "
+                        "advance to benchmark",
+                        ticket_id,
+                    )
+                    response = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "Provisioning agent completed but did "
+                                "not mark provisioning as complete "
+                                f"(hosts_provisioned="
+                                f"{cf.get('hosts_provisioned', [])!r}). "
+                                "Reply to retry provisioning, or "
+                                "manually set provisioning_complete "
+                                "if the hosts are ready."
+                            ),
+                        },
+                    )
+                    response.raise_for_status()
+                    return
+
                 next_step["status"] = "in_progress"
 
                 # Apply step overrides BEFORE saving the plan
@@ -1118,6 +1151,18 @@ async def run_agent_task(
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
+        if success:
+            dispatcher.clear_dispatch_failures(ticket_id)
+        else:
+            count = dispatcher.record_dispatch_failure(ticket_id, status)
+            logger.info(
+                "Dispatch failure %d/%d for %s at %s",
+                count,
+                dispatcher.MAX_DISPATCH_FAILURES,
+                ticket_id,
+                status,
+            )
+
         deposed = dispatcher.is_deposed()
         plan_managed = status in PLAN_AGENT_STATUS.values()
         logger.info(
@@ -1191,11 +1236,13 @@ async def _transition_to_guidance(
     ticket_id: str,
     comment: str,
     event_bus: EventBus | None = None,
-) -> None:
+) -> bool:
     """Transition a ticket to awaiting_customer_guidance.
 
     Used by orchestrator-level error handlers (stale watchdog,
     task timeout) that operate outside an agent context.
+
+    Returns True if the transition succeeded, False otherwise.
     """
 
     trace_context = current_trace_context() or new_trace_context(
@@ -1203,20 +1250,32 @@ async def _transition_to_guidance(
     )
     context_token = bind_trace_context(trace_context)
     try:
+        # Use unfenced headers: this recovery path may run after
+        # the claim is released, and sending session+epoch without
+        # claim_id triggers a 409 from the fencing middleware.
         async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=_auth_headers()
+            timeout=10.0, headers=_auth_headers_unfenced()
         ) as client:
-            await client.post(
+            resp = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={
                     "status": "awaiting_customer_guidance",
                     "comment": comment,
                 },
             )
+            if resp.status_code >= 400:
+                logger.error(
+                    "Guidance transition failed (HTTP %d) for %s",
+                    resp.status_code,
+                    ticket_id,
+                )
+                return False
+            return True
     except Exception:
         logger.exception(
             f"Failed to transition {ticket_id} to awaiting_customer_guidance"
         )
+        return False
     finally:
         reset_trace_context(context_token)
 
@@ -1471,7 +1530,12 @@ async def _block_handoff_failed(
     """
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+    # Use unfenced headers: the claim has already been released by
+    # mark_done(), so sending session+epoch without a claim_id would
+    # trigger a 409 from the state store's fencing middleware.
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=_auth_headers_unfenced()
+    ) as client:
         if retry_status:
             rewind_comment = (
                 f"Rewinding to {retry_status} so the agent"
@@ -2186,6 +2250,36 @@ async def _poll_loop_after_lease(
                         logger.info(f"Skipping {tid} at {status}: is_active")
                         continue
 
+                    if dispatcher.dispatch_failures_exhausted(tid, status):
+                        logger.error(
+                            "Dispatch failures exhausted for %s at %s "
+                            "— transitioning to guidance",
+                            tid,
+                            status,
+                        )
+                        escalated = await _transition_to_guidance(
+                            config.state_store_url,
+                            tid,
+                            (
+                                f"Agent failed {dispatcher.MAX_DISPATCH_FAILURES} "
+                                f"consecutive times at {status}. "
+                                f"Pausing for human review."
+                            ),
+                            event_bus=dispatcher.events,
+                        )
+                        if escalated:
+                            dispatcher.clear_dispatch_failures(tid)
+                        else:
+                            logger.warning(
+                                "Escalation failed for %s — keeping "
+                                "failure count to prevent crash loop",
+                                tid,
+                            )
+                        continue
+
+                    if dispatcher.is_dispatch_cooling_down(tid, status):
+                        continue
+
                     cf = ticket.get("custom_fields", {})
                     if status == "awaiting_review" and cf.get("review_submitted"):
                         logger.info(f"Skipping {tid}: review already submitted")
@@ -2279,22 +2373,63 @@ async def _poll_loop_after_lease(
                     ok, reason = check_handoff(status, ticket)
                     if not ok:
                         if not dispatcher.is_handoff_blocked(tid, status):
-                            logger.warning(
-                                f"Handoff blocked for {tid} at {status}: {reason}"
-                            )
-                            recovered = await _block_handoff_failed(
-                                config.state_store_url,
-                                tid,
-                                reason,
-                                status,
-                                event_bus=dispatcher.events,
-                            )
-                            # Only mark as blocked if the HITL
-                            # transition succeeded. If it failed,
-                            # leave unblocked so we retry next cycle
-                            # instead of hanging forever.
-                            if recovered:
-                                dispatcher.mark_handoff_blocked(tid, status)
+                            if dispatcher.handoff_retries_exhausted(tid, status):
+                                logger.error(
+                                    "Handoff recovery retries exhausted for "
+                                    "%s at %s — forcing guidance transition",
+                                    tid,
+                                    status,
+                                )
+                                escalated = await _transition_to_guidance(
+                                    config.state_store_url,
+                                    tid,
+                                    (
+                                        f"Handoff recovery failed after "
+                                        f"{dispatcher.MAX_HANDOFF_RETRIES} "
+                                        f"attempts at {status}: {reason}"
+                                    ),
+                                    event_bus=dispatcher.events,
+                                )
+                                if escalated:
+                                    dispatcher.mark_handoff_blocked(
+                                        tid,
+                                        status,
+                                    )
+                                else:
+                                    dispatcher.mark_handoff_blocked(
+                                        tid,
+                                        status,
+                                    )
+                                    logger.warning(
+                                        "Forced guidance also failed for %s "
+                                        "— suppressing until status changes",
+                                        tid,
+                                    )
+                            else:
+                                retry_num = dispatcher.record_handoff_retry(
+                                    tid,
+                                    status,
+                                )
+                                logger.warning(
+                                    "Handoff blocked for %s at %s (attempt %d/%d): %s",
+                                    tid,
+                                    status,
+                                    retry_num,
+                                    dispatcher.MAX_HANDOFF_RETRIES,
+                                    reason,
+                                )
+                                recovered = await _block_handoff_failed(
+                                    config.state_store_url,
+                                    tid,
+                                    reason,
+                                    status,
+                                    event_bus=dispatcher.events,
+                                )
+                                if recovered:
+                                    dispatcher.mark_handoff_blocked(
+                                        tid,
+                                        status,
+                                    )
                         continue
 
                     # Per-user/group quota check (multi-user only).
@@ -2547,6 +2682,17 @@ def _auth_headers() -> dict[str, str]:
             }
         )
     return headers
+
+
+def _auth_headers_unfenced() -> dict[str, str]:
+    """Auth-only headers without fencing (session/epoch/claim).
+
+    Used by recovery paths that operate after claim release —
+    sending partial fencing headers (session + epoch but no
+    claim_id) triggers a 409 from the state store.
+    """
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def _sweep_trace_spools() -> None:

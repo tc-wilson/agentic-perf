@@ -18,6 +18,13 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Activate the project virtualenv so that pytest can import
+# third-party dependencies (mcp, httpx, pydantic, etc.).
+if [[ -f "$repo_root/.venv/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$repo_root/.venv/bin/activate"
+fi
+
 # Collect staged Python files
 STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
 
