@@ -31,6 +31,7 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    FORBIDDEN_REBOOT_HOSTS,
     _emit_context_audit_event,
     _public_context_document,
     _public_context_result,
@@ -39,6 +40,7 @@ from agents.server_utils import (
     build_skill_provider,
     build_ssh_from_ticket,
     controller_context_gateway,
+    is_self_host,
     read_skill_documents,
     tool_progress,
 )
@@ -353,6 +355,11 @@ _SHELL_INJECTION_RE = re.compile(
     r";|&&|\|\||`|\$\(|\|",
 )
 
+_ARCAFLOW_PLUGIN_IMAGE_RE = re.compile(
+    r"^quay\.io/arcalot/arcaflow-plugin-[a-z0-9][a-z0-9._-]*"
+    r"(?::[a-zA-Z0-9][a-zA-Z0-9._-]*|@sha256:[0-9a-fA-F]{64})?$"
+)
+
 
 def _validate_run_command(
     run_command: str,
@@ -390,28 +397,21 @@ def _validate_run_command(
     return True, "OK"
 
 
-# Hosts that must never be passed as a reboot target.
-# boot-timings-test.sh reboots the SUT — hitting localhost
-# would kill the orchestrator.
-_FORBIDDEN_REBOOT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+def _validate_plugin_image(plugin_image: str) -> tuple[bool, str]:
+    """Validate an Arcaflow plugin image before using it in a remote command."""
+    if not isinstance(plugin_image, str) or not plugin_image.strip():
+        return False, "plugin_image must be a non-empty string"
+    if not _ARCAFLOW_PLUGIN_IMAGE_RE.fullmatch(plugin_image):
+        return (
+            False,
+            "plugin_image must be a quay.io/arcalot/arcaflow-plugin image "
+            "with an optional tag or sha256 digest",
+        )
+    return True, "OK"
 
 
-def _is_self_host(host: str) -> bool:
-    """Return True if *host* resolves to the orchestrator itself."""
-    import socket
-
-    if host.lower() in _FORBIDDEN_REBOOT_HOSTS:
-        return True
-    try:
-        own_hostname = socket.gethostname()
-        if host.lower() == own_hostname.lower():
-            return True
-        own_fqdn = socket.getfqdn()
-        if host.lower() == own_fqdn.lower():
-            return True
-    except Exception:
-        pass
-    return False
+_FORBIDDEN_REBOOT_HOSTS = FORBIDDEN_REBOOT_HOSTS
+_is_self_host = is_self_host
 
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
@@ -465,6 +465,10 @@ def _benchmark_intent_identity(
     return operation_key, request_hash, immutable
 
 
+_BENCHMARK_LEASE_TTL_SECONDS = 300.0
+_BENCHMARK_LEASE_RENEW_SECONDS = 100.0
+
+
 class _BenchmarkOperation:
     """Small async adapter over the shared fenced operation registry."""
 
@@ -487,6 +491,7 @@ class _BenchmarkOperation:
     async def acquire(self) -> tuple[dict[str, Any], str]:
         from providers.tracing.client import TraceClient
 
+        ttl = int(_BENCHMARK_LEASE_TTL_SECONDS)
         token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
         url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
         if token:
@@ -500,11 +505,9 @@ class _BenchmarkOperation:
                     self._client.operation_acquire,
                     self.key,
                     self.request_hash,
-                    _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
+                    ttl,
                 )
             except Exception as exc:
-                # Only a conflict proves that another worker owns the intent.
-                # Authentication, transport, and 5xx failures must fail closed.
                 cause = exc
                 while cause is not None:
                     response = getattr(cause, "response", None)
@@ -533,7 +536,7 @@ class _BenchmarkOperation:
                 self.key,
                 self.request_hash,
                 self.owner,
-                _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
+                ttl,
             )
         except (OperationLeaseError, OperationTransitionError):
             operation = self._local.get_operation(self.key)
