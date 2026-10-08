@@ -468,13 +468,14 @@ class BenchmarkAgent(AgentBase):
             state_store_url=self.store_url,
             agent_name=self.agent_name,
         )
-        await mcp.connect_ticket_server(
-            arcaflow_plugin_server,
-            name="arcaflow-plugins",
-            ticket_id=ticket_id,
-            state_store_url=self.store_url,
-            agent_name=self.agent_name,
-        )
+        # TODO: re-enable once arcaflow MCP connection issue is resolved
+        # await mcp.connect_ticket_server(
+        #     arcaflow_plugin_server,
+        #     name="arcaflow-plugins",
+        #     ticket_id=ticket_id,
+        #     state_store_url=self.store_url,
+        #     agent_name=self.agent_name,
+        # )
 
         # Workflow harnesses may expose their discovery and execution tools
         # through a configured external MCP server (for example the Arcaflow

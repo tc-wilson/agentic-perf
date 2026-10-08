@@ -170,8 +170,14 @@ class AgentMCPClient:
         For non-Python MCP servers (e.g., Jumpstarter's
         ``jmp mcp serve``), use connect_command() instead.
         """
+        venv = os.environ.get("VIRTUAL_ENV")
+        python = (
+            os.path.join(venv, "bin", "python3")
+            if venv and os.path.isfile(os.path.join(venv, "bin", "python3"))
+            else sys.executable
+        )
         await self.connect_command(
-            command=sys.executable,
+            command=python,
             args=[server_script],
             name=name or server_script,
             env=env,

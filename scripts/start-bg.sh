@@ -20,6 +20,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_DIR"
 
+# Activate the project virtualenv so that python3 resolves to the
+# venv interpreter.  MCP subprocesses inherit sys.executable from
+# the orchestrator — using the system Python can hit version
+# mismatches in third-party packages (e.g., mcp McpError → MCPError).
+if [[ -f "$REPO_DIR/.venv/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$REPO_DIR/.venv/bin/activate"
+fi
+
 AP_HOME="${AGENTIC_PERF_HOME:-$HOME/.agentic-perf}"
 export AGENTIC_PERF_HOME="$AP_HOME"
 CONFIG="$AP_HOME/config.json"
