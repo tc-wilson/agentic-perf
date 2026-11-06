@@ -608,6 +608,13 @@ class ProvisioningAgent(AgentBase):
         for host in hosts:
             record = records.get(host)
             if not isinstance(record, dict):
+                # The tool keys by canonical address; the ticket uses FQDNs.
+                # Match by requested_as to bridge the two forms.
+                for key, val in records.items():
+                    if isinstance(val, dict) and val.get("requested_as", "") == host:
+                        record = val
+                        break
+            if not isinstance(record, dict):
                 outcome = "outcome not confirmed (no host result was returned)"
             else:
                 state = record.get("state")
